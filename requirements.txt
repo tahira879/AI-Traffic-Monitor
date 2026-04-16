@@ -1,0 +1,11 @@
+streamlit
+ultralytics
+opencv-python
+pandas
+openpyxl
+easyocr
+roboflow
+numpy
+Pillow
+torch
+torchvision
