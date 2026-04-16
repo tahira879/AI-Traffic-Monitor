@@ -34,30 +34,43 @@ def calculate_speed(prev_center, curr_center, fps, ppm=8): # ppm=8 is a guess va
     speed_mps = distance_meters / time_seconds
     speed_kmh = speed_mps * 3.6
     return int(speed_kmh)
-
 def process_video(video_path, signal_red):
+    import gc # Import garbage collector to clear memory
+    
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
+    # Reduce video resolution for processing to save RAM
+    # New dimensions (Half the original size)
+    new_width = 640
+    new_height = 480
+    
     output_path = "output_video.mp4"
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    out = cv2.VideoWriter(output_path, fourcc, fps, (new_width, new_height))
 
     tracker_history = defaultdict(list)
     vehicle_crossed_line = {}
-    stop_line_y = int(height * 0.6)  
+    # Adjust stop line according to new height
+    stop_line_y = int(new_height * 0.6)  
     violations_data = []
     stframe = st.empty()
+    
+    frame_count = 0
     
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Run YOLO Tracking
-        results = model.track(frame, persist=True, verbose=False)
+        # Resize frame immediately to save RAM during processing
+        frame = cv2.resize(frame, (new_width, new_height))
+
+        # --- MAIN CHANGE HERE ---
+        # imgsz=320 forces the model to process at very low resolution (saving huge memory)
+        results = model.track(frame, persist=True, verbose=False, imgsz=320)
         
         if results[0].boxes.id is not None:
             boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -70,13 +83,11 @@ def process_video(video_path, signal_red):
                 cls_id = classes[i]
                 class_name = model.names[cls_id]
                 
-                # Filter only vehicles (Ignore people etc for this demo)
                 if class_name not in ['car', 'truck', 'bus', 'motorcycle', 'bicycle']:
                     continue
 
                 center = (int((x1 + x2) / 2), int((y1 + y2) / 2))
 
-                # Speed Calc
                 if id in tracker_history and len(tracker_history[id]) > 0:
                     prev_center = tracker_history[id][-1]
                     speed = calculate_speed(prev_center, center, fps)
@@ -87,9 +98,8 @@ def process_video(video_path, signal_red):
                 if len(tracker_history[id]) > 10:
                     tracker_history[id].pop(0)
 
-                # Violation Logic
                 is_violation = False
-                plate_text = "UNKNOWN" # Removed EasyOCR to avoid errors
+                plate_text = "UNKNOWN"
                 
                 if signal_red and (y1 < stop_line_y < y2):
                     if id not in vehicle_crossed_line:
@@ -102,12 +112,11 @@ def process_video(video_path, signal_red):
                         }
                         violations_data.append(new_row)
 
-                # Visuals
-                color = (0, 255, 0) # Green
+                color = (0, 255, 0)
                 label = f"{class_name} {speed}km/h"
 
                 if is_violation:
-                    color = (0, 0, 255) # Red
+                    color = (0, 0, 255)
                     label = f"VIOLATION! {class_name}"
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
                     cv2.putText(frame, "SIGNAL VIOLATION", (x1, y1 - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
@@ -115,49 +124,29 @@ def process_video(video_path, signal_red):
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                 cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Draw Line
-        cv2.line(frame, (0, stop_line_y), (width, stop_line_y), (0, 255, 255), 2)
+        cv2.line(frame, (0, stop_line_y), (new_width, stop_line_y), (0, 255, 255), 2)
         cv2.putText(frame, "STOP LINE", (10, stop_line_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         out.write(frame)
         stframe.image(frame, channels="BGR")
+        
+        # --- MEMORY CLEANUP ---
+        # Clear 'results' variable to free RAM
+        del results
+        gc.collect()
+        
+        frame_count += 1
 
     cap.release()
     out.release()
     
     if violations_data:
         df_new = pd.DataFrame(violations_data)
-        df_existing = pd.read_excel(EXCEL_FILE)
-        df_final = pd.concat([df_existing, df_new])
+        if os.path.exists(EXCEL_FILE):
+            df_existing = pd.read_excel(EXCEL_FILE)
+            df_final = pd.concat([df_existing, df_new])
+        else:
+            df_final = df_new
         df_final.to_excel(EXCEL_FILE, index=False)
     
     return "output_video.mp4"
-
-# --- UI ---
-st.title("🚦 AI Traffic Monitoring System (Demo Mode)")
-st.sidebar.header("Settings")
-
-signal_red = st.sidebar.checkbox("Signal Status (RED = Violation)", value=False)
-video_file = st.file_uploader("Upload Traffic Video", type=["mp4", "avi"])
-
-if video_file is not None:
-    temp_video = "temp_input.mp4"
-    with open(temp_video, "wb") as f:
-        f.write(video_file.getbuffer())
-    
-    st.video(temp_video)
-    
-    if st.button("Start Detection"):
-        st.info("Processing... This may take a moment.")
-        output_file = process_video(temp_video, signal_red)
-        
-        st.success("Done!")
-        st.video(output_file)
-        
-        with open(EXCEL_FILE, "rb") as f:
-            st.download_button(
-                label="Download Excel Report",
-                data=f,
-                file_name="violations.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
